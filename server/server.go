@@ -2,10 +2,11 @@ package server
 
 import (
 	"fmt"
-	"github.com/pkg/errors"
 	"net/http"
 
+	"github.com/pachmu/skyeng-push-notificator/internal/sender"
 	"github.com/pachmu/skyeng-push-notificator/internal/skyeng"
+	"github.com/pkg/errors"
 )
 
 type Server struct {
@@ -13,12 +14,11 @@ type Server struct {
 	Port int
 }
 
-func (s *Server) Serve(user string, client skyeng.Client, changeWordset chan int, stop chan struct{}) error {
+func (s *Server) Serve(user string, client skyeng.Client, sender *sender.Sender) error {
 	h := handler{
-		skyengClient:  client,
-		changeWordset: changeWordset,
-		stop:          stop,
-		user:          user,
+		skyengClient: client,
+		sender:       sender,
+		user:         user,
 	}
 	http.HandleFunc("/get_wordsets", h.getWordsets)
 	http.HandleFunc("/set_wordset", h.setWordset)

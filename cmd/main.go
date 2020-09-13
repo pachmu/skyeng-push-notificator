@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pachmu/skyeng-push-notificator/config"
+	"github.com/pachmu/skyeng-push-notificator/internal/bot"
 	"github.com/pachmu/skyeng-push-notificator/internal/pushover"
 	"github.com/pachmu/skyeng-push-notificator/internal/sender"
 	"github.com/pachmu/skyeng-push-notificator/internal/skyeng"
@@ -29,18 +30,15 @@ func main() {
 
 	pushoverClient := pushover.NewClient(conf.Pushover.Token, conf.Pushover.User, conf.Pushover.Device)
 
-	changeWordset := make(chan int)
-	stop := make(chan struct{})
-	terminate := make(chan struct{})
+	terminateSender := make(chan struct{}, 1)
+	terminateBot := make(chan struct{}, 1)
 
-	sndr := sender.Sender{
-		Skyeng:        skyengClient,
-		Pushover:      pushoverClient,
-		ChangeWordset: changeWordset,
-		Suspend:       stop,
-		Terminate:     terminate,
-		TimeInterval:  time.Second * time.Duration(conf.SendInterval),
-	}
+	sndr := sender.NewSender(
+		skyengClient,
+		pushoverClient,
+		terminateSender,
+		time.Second*time.Duration(conf.SendInterval),
+	)
 	wg := sync.WaitGroup{}
 	go func() {
 		wg.Add(1)
@@ -53,12 +51,28 @@ func main() {
 	}()
 	logrus.Info("Sender started")
 
+	handler := bot.NewMessageHandler(conf.Bot.User, skyengClient, sndr)
+	bt, err := bot.NewTelegramBot(conf.Bot.Token, terminateBot, handler)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+	go func() {
+		wg.Add(1)
+		defer wg.Done()
+
+		err := bt.Run()
+		if err != nil {
+			logrus.Error(fmt.Sprintf("%+v", err))
+		}
+	}()
+	logrus.Info("Bot started")
+
 	go func() {
 		srv := server.Server{
 			Addr: "",
 			Port: conf.Port,
 		}
-		err := srv.Serve(conf.Skyeng.User, skyengClient, changeWordset, stop)
+		err := srv.Serve(conf.Skyeng.User, skyengClient, sndr)
 		if err != nil {
 			logrus.Error(fmt.Sprintf("%+v", err))
 		}
@@ -69,7 +83,8 @@ func main() {
 	signal.Notify(quitCh, os.Kill, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
 	<-quitCh
-	terminate <- struct{}{}
+	terminateSender <- struct{}{}
+	terminateBot <- struct{}{}
 	wg.Wait()
 	logrus.Info("Process terminated")
 }

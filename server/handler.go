@@ -3,23 +3,23 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"github.com/pachmu/skyeng-push-notificator/internal/sender"
 	"github.com/pachmu/skyeng-push-notificator/internal/skyeng"
 	log "github.com/sirupsen/logrus"
 	"net/http"
 )
 
 type handler struct {
-	skyengClient  skyeng.Client
-	changeWordset chan int
-	user          string
-	stop          chan struct{}
+	skyengClient skyeng.Client
+	user         string
+	sender       *sender.Sender
 }
 
 func (h *handler) getWordsets(w http.ResponseWriter, req *http.Request) {
 	if !h.auth(w, req) {
 		return
 	}
-	wordsets, err := h.skyengClient.GetWordsets()
+	wordsets, err := h.skyengClient.GetWordsets(0)
 	if err != nil {
 		log.Error("failed to get wordsets from skyeng, got ", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -63,14 +63,14 @@ func (h *handler) setWordset(w http.ResponseWriter, req *http.Request) {
 
 		return
 	}
-	h.changeWordset <- ID
+	h.sender.ChangeCurrentWordset(ID)
 }
 
 func (h *handler) stopSending(w http.ResponseWriter, req *http.Request) {
 	if !h.auth(w, req) {
 		return
 	}
-	h.stop <- struct{}{}
+	h.sender.SuspendWork()
 	log.Info("Sending stopped")
 }
 

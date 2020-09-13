@@ -1,3 +1,0 @@
-package pushover
-
-import "fmt"

@@ -10,10 +10,12 @@ import (
 	"net/http"
 )
 
+// Client represents Pushover interface.
 type Client interface {
 	SendPush(title string, message string) error
 }
 
+// NewClient returns Client compatible functionality.
 func NewClient(token string, user string, device string) Client {
 	return &client{
 		endpoint: "https://api.pushover.net",
@@ -30,6 +32,7 @@ type client struct {
 	device   string
 }
 
+// SendPush sends push to Pushover.
 func (c client) SendPush(title string, message string) error {
 	msg := map[string]interface{}{
 		"token":   c.token,
@@ -57,8 +60,10 @@ func (c client) SendPush(title string, message string) error {
 	return nil
 }
 
+// MockPushover is fake Pushover client
 type MockPushover struct{}
 
+// SendPush is fake pushover method.
 func (t MockPushover) SendPush(title string, message string) error {
 	fmt.Printf("Push sended: title %q, message %q \n", title, message)
 	return nil

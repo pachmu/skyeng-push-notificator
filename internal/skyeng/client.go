@@ -9,12 +9,16 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	errs "github.com/pkg/errors"
 )
 
-const maxRetries = 3
+const (
+	// maxHttpRetries represents max count of retries.
+	maxHttpRetries = 3
+)
 
 type Wordset struct {
 	ID    int    `json:"id"`
@@ -52,9 +56,9 @@ var ErrWordsetNotFound = errors.New("wordset not found")
 var ErrMeaningNotFound = errors.New("meaning not found")
 
 type Client interface {
-	GetWordsets() ([]Wordset, error)
+	GetWordsets(page int) ([]Wordset, error)
 	GetWords(ws Wordset) ([]Word, error)
-	GetMeaning(w Word) (*Meaning, error)
+	GetMeaning(w ...Word) ([]Meaning, error)
 }
 
 func NewClient(username string, password string) Client {
@@ -78,12 +82,19 @@ type client struct {
 	token         string
 }
 
-func (c *client) GetWordsets() ([]Wordset, error) {
-	var wordsetData WordsetsData
+const resultMaxPageSize = 100
 
-	wordsetURL := c.wordsEndpoint + "/for-vimbox/v1/wordsets.json?pageSize=100&page=1"
-	err := c.invoke("GET", wordsetURL, nil, func(resp []byte) error {
-		err := json.Unmarshal(resp, &wordsetData)
+func (c *client) GetWordsets(page int) ([]Wordset, error) {
+	var wordsetsData WordsetsData
+	var pageSuff string
+	if page == 0 {
+		pageSuff = fmt.Sprintf("?pageSize=%d&page=1", resultMaxPageSize)
+	} else {
+		pageSuff = fmt.Sprintf("?page=%d", page)
+	}
+	wordsetsURL := fmt.Sprintf("%s/for-vimbox/v1/wordsets.json%s", c.wordsEndpoint, pageSuff)
+	err := c.invoke("GET", wordsetsURL, nil, func(resp []byte) error {
+		err := json.Unmarshal(resp, &wordsetsData)
 		if err != nil {
 			return errs.WithStack(err)
 		}
@@ -94,7 +105,7 @@ func (c *client) GetWordsets() ([]Wordset, error) {
 		return nil, err
 	}
 
-	return wordsetData.Data, nil
+	return wordsetsData.Data, nil
 }
 
 func (c *client) GetWords(ws Wordset) ([]Word, error) {
@@ -116,12 +127,17 @@ func (c *client) GetWords(ws Wordset) ([]Word, error) {
 	return words.Data, nil
 }
 
-func (c *client) GetMeaning(w Word) (*Meaning, error) {
-	var meaning []Meaning
-	wordsURL := fmt.Sprintf(c.dictEndpoint+"/for-services/v2/meanings?ids=%d", w.MeaningID)
+func (c *client) GetMeaning(words ...Word) ([]Meaning, error) {
+	var meanings []Meaning
+	var m []string
+	for _, word := range words {
+		m = append(m, strconv.Itoa(word.MeaningID))
+	}
+	meaningIDs := strings.Join(m, ",")
+	wordsURL := fmt.Sprintf(c.dictEndpoint+"/for-services/v2/meanings?ids=%s", meaningIDs)
 
 	err := c.invoke("GET", wordsURL, nil, func(resp []byte) error {
-		err := json.Unmarshal(resp, &meaning)
+		err := json.Unmarshal(resp, &meanings)
 		if err != nil {
 			return errs.WithStack(err)
 		}
@@ -131,14 +147,14 @@ func (c *client) GetMeaning(w Word) (*Meaning, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(meaning) == 0 {
-		return nil, errs.Wrapf(ErrMeaningNotFound, "meaningID: %d", w.MeaningID)
+	if len(meanings) == 0 {
+		return nil, errs.Wrapf(ErrMeaningNotFound, "meaningID: %s", meaningIDs)
 	}
-	return &meaning[0], nil
+	return meanings, nil
 }
 
 func (c *client) invoke(method string, URL string, body []byte, f func(resp []byte) error) error {
-	for i := 0; i < maxRetries; i++ {
+	for i := 0; i < maxHttpRetries; i++ {
 		var respBody []byte
 		err := func() error {
 			req, err := http.NewRequest(method, URL, bytes.NewBuffer(body))
