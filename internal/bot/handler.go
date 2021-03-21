@@ -1,62 +1,66 @@
 package bot
 
 import (
+	"context"
 	"fmt"
+	"math/rand"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/pachmu/skyeng-push-notificator/internal/sender"
-
 	"github.com/go-telegram-bot-api/telegram-bot-api"
 	"github.com/pachmu/skyeng-push-notificator/internal/skyeng"
+	"github.com/pachmu/skyeng-push-notificator/internal/state"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
 // TelegramBot represents bot api.
 type TelegramBot interface {
-	Run() error
+	Run(ctx context.Context) error
 }
 
 // NewTelegramBot returns telegram api compatible struct.
-func NewTelegramBot(token string, terminate <-chan struct{}, handler MessageHandler) (TelegramBot, error) {
+func NewTelegramBot(token string, handler *MessageHandler) (TelegramBot, error) {
 	b, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	handler.api = b
 	return &bot{
-		terminate: terminate,
-		handler:   handler,
-		bot:       b,
+		handler: handler,
+		bot:     b,
 	}, nil
 }
 
 const (
 	actionStart          = "/start"
-	actionGetWordsets    = "Show_wordsets"
-	actionSuspend        = "Suspend"
-	actionChangeInterval = "Interval"
+	actionGetWordsets    = "/show_wordsets"
+	actionSuspend        = "/suspend"
+	actionChangeInterval = "/interval"
+	actionStartRandom    = "/start_random"
 )
 
 const (
 	callbackNextWordsetPage = "next"
 	callbackPrevWordsetPage = "prev"
 	callbackGetWords        = "get_words"
+	callbackGetWord         = "get_word"
 	callbackSetWordset      = "set_wordset"
+	callbackShowDefinition  = "show_definition"
+	callbackShowExamples    = "show_examples"
 )
 
 type botActions map[string]func(m *tgbotapi.Message, resp *tgbotapi.MessageConfig, params []string) error
 type botCallbacks map[string]func(resp *tgbotapi.MessageConfig, args []string) error
 
 type bot struct {
-	terminate <-chan struct{}
-	handler   MessageHandler
-	bot       *tgbotapi.BotAPI
+	handler *MessageHandler
+	bot     *tgbotapi.BotAPI
 }
 
-func (b *bot) Run() error {
+func (b *bot) Run(ctx context.Context) error {
 	b.bot.Debug = false
 
 	logrus.Infof("Authorized on account %s", b.bot.Self.UserName)
@@ -80,18 +84,18 @@ func (b *bot) Run() error {
 			if err != nil {
 				logrus.Error(err)
 			}
-		case <-b.terminate:
+		case <-ctx.Done():
 			return nil
 		}
 	}
 }
 
 // NewMessageHandler returns MessageHandler.
-func NewMessageHandler(user string, client skyeng.Client, sender *sender.Sender) MessageHandler {
-	h := MessageHandler{
+func NewMessageHandler(user string, client skyeng.Client, state *state.State) *MessageHandler {
+	h := &MessageHandler{
 		skyengClient: client,
 		user:         user,
-		sender:       sender,
+		state:        state,
 	}
 	h.actions = botActions{
 		actionStart: func(m *tgbotapi.Message, resp *tgbotapi.MessageConfig, params []string) error {
@@ -99,11 +103,21 @@ func NewMessageHandler(user string, client skyeng.Client, sender *sender.Sender)
 			h.withActionKeyboard(resp)
 			return nil
 		},
+		actionStartRandom: func(m *tgbotapi.Message, resp *tgbotapi.MessageConfig, params []string) error {
+			f, err := h.getRandomPeriodicSenderCallback(resp)
+			if err != nil {
+				return err
+			}
+			state.SetWordsetCallback(f)
+			resp.Text = "Random sending started!"
+
+			return nil
+		},
 		actionGetWordsets: func(m *tgbotapi.Message, resp *tgbotapi.MessageConfig, params []string) error {
-			return h.getWordsets(resp, 1)
+			return h.showWordsets(resp, 1)
 		},
 		actionSuspend: func(m *tgbotapi.Message, resp *tgbotapi.MessageConfig, params []string) error {
-			h.sender.SuspendWork()
+			h.state.SuspendWork()
 			resp.Text = "Work suspended!"
 
 			return nil
@@ -116,7 +130,7 @@ func NewMessageHandler(user string, client skyeng.Client, sender *sender.Sender)
 			if err != nil {
 				return errors.Wrap(err, "failed to parse interval value")
 			}
-			h.sender.ChangeTimeInterval(time.Duration(interval) * time.Minute)
+			h.state.ChangeTimeInterval(time.Duration(interval) * time.Minute)
 			resp.Text = "Time interval changed!"
 
 			return nil
@@ -141,7 +155,7 @@ func NewMessageHandler(user string, client skyeng.Client, sender *sender.Sender)
 			return err
 		}
 
-		return h.getWordsets(resp, page)
+		return h.showWordsets(resp, page)
 	}
 
 	h.callbacks = botCallbacks{
@@ -150,7 +164,28 @@ func NewMessageHandler(user string, client skyeng.Client, sender *sender.Sender)
 			if err != nil {
 				return err
 			}
-			return h.getWords(resp, wordsetID, strings.Join(args[1:], " "))
+			return h.showWords(resp, wordsetID, strings.Join(args[1:], " "))
+		},
+		callbackGetWord: func(resp *tgbotapi.MessageConfig, args []string) error {
+			meaningID, err := argToInt(args, "failed to get word by id")
+			if err != nil {
+				return err
+			}
+			return h.showWord(resp, meaningID)
+		},
+		callbackShowExamples: func(resp *tgbotapi.MessageConfig, args []string) error {
+			meaningID, err := argToInt(args, "failed to get meaning by id")
+			if err != nil {
+				return err
+			}
+			return h.showExamples(resp, meaningID)
+		},
+		callbackShowDefinition: func(resp *tgbotapi.MessageConfig, args []string) error {
+			meaningID, err := argToInt(args, "failed to get meaning by id")
+			if err != nil {
+				return err
+			}
+			return h.showDefinition(resp, meaningID)
 		},
 		callbackNextWordsetPage: navigate,
 		callbackPrevWordsetPage: navigate,
@@ -159,7 +194,22 @@ func NewMessageHandler(user string, client skyeng.Client, sender *sender.Sender)
 			if err != nil {
 				return err
 			}
-			h.sender.ChangeCurrentWordset(wordsetID)
+			if len(args) < 2 {
+				return errors.New("not enough args")
+			}
+			state.SetWordsetCallback(func() error {
+				wordsetResp := tgbotapi.NewMessage(resp.ChatID, "")
+				err := h.showWords(&wordsetResp, wordsetID, args[1])
+				if err != nil {
+					return err
+				}
+				_, err = h.api.Send(wordsetResp)
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				return nil
+			})
+
 			resp.Text = "Wordset changed!"
 
 			return nil
@@ -174,7 +224,7 @@ type MessageHandler struct {
 	api          *tgbotapi.BotAPI
 	user         string
 	actions      botActions
-	sender       *sender.Sender
+	state        *state.State
 	skyengClient skyeng.Client
 	callbacks    botCallbacks
 }
@@ -182,7 +232,7 @@ type MessageHandler struct {
 func (h *MessageHandler) handle(upd tgbotapi.Update) error {
 	defer func() {
 		if err := recover(); err != nil {
-			logrus.Error(err)
+			logrus.Error(err, string(debug.Stack()))
 		}
 	}()
 
@@ -305,7 +355,32 @@ func (h *MessageHandler) handleCallback(query *tgbotapi.CallbackQuery, resp *tgb
 	return nil
 }
 
-func (h *MessageHandler) getWordsets(resp *tgbotapi.MessageConfig, page int) error {
+func (h *MessageHandler) getRandomPeriodicSenderCallback(resp *tgbotapi.MessageConfig) (func() error, error) {
+	wordsets, err := h.skyengClient.GetWordsets(0)
+	if err != nil {
+		return nil, err
+	}
+	rand.Seed(time.Now().Unix())
+	getRandWordsetID := func() (int, string) {
+		num := rand.Intn(len(wordsets))
+		return wordsets[num].ID, wordsets[num].Title
+	}
+	return func() error {
+		wordsetID, name := getRandWordsetID()
+		wordsetResp := tgbotapi.NewMessage(resp.ChatID, "")
+		err := h.showWords(&wordsetResp, wordsetID, name)
+		if err != nil {
+			return err
+		}
+		_, err = h.api.Send(wordsetResp)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		return nil
+	}, nil
+}
+
+func (h *MessageHandler) showWordsets(resp *tgbotapi.MessageConfig, page int) error {
 	wordsets, err := h.skyengClient.GetWordsets(page)
 	if err != nil {
 		return err
@@ -342,28 +417,105 @@ func (h *MessageHandler) getWordsets(resp *tgbotapi.MessageConfig, page int) err
 	return nil
 }
 
-func (h *MessageHandler) getWords(resp *tgbotapi.MessageConfig, wordsetID int, wordsetName string) error {
+func (h *MessageHandler) showWords(resp *tgbotapi.MessageConfig, wordsetID int, wordsetName string) error {
 	words, err := h.skyengClient.GetWords(skyeng.Wordset{ID: wordsetID})
 	if err != nil {
 		return err
 	}
 	meanings, err := h.skyengClient.GetMeaning(words...)
-	builder := strings.Builder{}
-	builder.WriteString(fmt.Sprintf("<b>%s</b>\n", wordsetName))
-	for _, m := range meanings {
-		builder.WriteString(m.Text + "\n")
+	if err != nil {
+		return err
 	}
-	resp.Text = builder.String()
-
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	for _, m := range meanings {
+		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData(m.Text, fmt.Sprintf("%s %d", callbackGetWord, m.ID)),
+		})
+	}
+	buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardButtonData(
+			"Choose wordset", fmt.Sprintf("%s %d %s", callbackSetWordset, wordsetID, wordsetName),
+		),
+	})
+	resp.Text = "Choose word to show translation and examples."
 	resp.ParseMode = tgbotapi.ModeHTML
-	resp.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-		[]tgbotapi.InlineKeyboardButton{
-			tgbotapi.NewInlineKeyboardButtonData("Choose wordset", fmt.Sprintf("set_wordset %d", wordsetID)),
-		},
-	)
+	resp.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
 
 	return nil
 
+}
+
+func (h *MessageHandler) showWord(resp *tgbotapi.MessageConfig, meaningID int) error {
+	meanings, err := h.skyengClient.GetMeaning(skyeng.Word{
+		MeaningID: meaningID,
+	})
+	if err != nil {
+		return err
+	}
+	if len(meanings) == 0 {
+		return errors.WithStack(errors.New("failed to get word meaning"))
+	}
+	builder := strings.Builder{}
+	for _, m := range meanings {
+		builder.WriteString(fmt.Sprintf("%s\n %s\n %s\n", m.Text, m.Transcription, m.Translation))
+	}
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardButtonData(
+			"Show definition", fmt.Sprintf("%s %d", callbackShowDefinition, meaningID),
+		),
+	})
+	buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardButtonData(
+			"Show examples", fmt.Sprintf("%s %d", callbackShowExamples, meaningID),
+		),
+	})
+	resp.Text = builder.String()
+	resp.ParseMode = tgbotapi.ModeHTML
+	resp.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+
+	return nil
+}
+
+func (h *MessageHandler) showDefinition(resp *tgbotapi.MessageConfig, meaningID int) error {
+	meanings, err := h.skyengClient.GetMeaning(skyeng.Word{
+		MeaningID: meaningID,
+	})
+	if err != nil {
+		return err
+	}
+	if len(meanings) == 0 {
+		return errors.WithStack(errors.New("failed to get word meaning"))
+	}
+	builder := strings.Builder{}
+	for _, m := range meanings {
+		builder.WriteString(fmt.Sprintf("%s\n %s", m.Text, m.Definition.Text))
+	}
+	resp.Text = builder.String()
+
+	return nil
+}
+
+func (h *MessageHandler) showExamples(resp *tgbotapi.MessageConfig, meaningID int) error {
+	meanings, err := h.skyengClient.GetMeaning(skyeng.Word{
+		MeaningID: meaningID,
+	})
+	if err != nil {
+		return err
+	}
+	if len(meanings) == 0 {
+		return errors.WithStack(errors.New("failed to get word meaning"))
+	}
+	builder := strings.Builder{}
+	for _, m := range meanings {
+		builder.WriteString(fmt.Sprintf("%s\n", m.Text))
+		for _, e := range m.Examples {
+			builder.WriteString(fmt.Sprintf("%s\n", e.Text))
+		}
+	}
+	resp.Text = builder.String()
+
+	return nil
 }
 
 func (h *MessageHandler) authorize(user string) error {

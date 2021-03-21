@@ -30,6 +30,7 @@ type WordsetsData struct {
 }
 
 type Word struct {
+	ID        int `json:"id"`
 	MeaningID int `json:"meaningId"`
 }
 
@@ -45,9 +46,21 @@ type Transcription struct {
 	Text string `json:"text"`
 }
 
+type Example struct {
+	Text string `json:"text"`
+}
+
+type Definition struct {
+	Text string `json:"text"`
+}
+
 type Meaning struct {
+	ID            int         `json:"id"`
+	MeaningID     int         `json:"meaningId"`
 	Text          string      `json:"text"`
 	Translation   Translation `json:"translation"`
+	Definition    Definition  `json:"definition"`
+	Examples      []Example   `json:"examples"`
 	Transcription string      `json:"transcription"`
 }
 
@@ -197,6 +210,7 @@ func (c *client) invoke(method string, URL string, body []byte, f func(resp []by
 		if err != nil {
 			return err
 		}
+		break
 	}
 
 	return nil
