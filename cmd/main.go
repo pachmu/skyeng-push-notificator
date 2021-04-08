@@ -3,18 +3,17 @@ package main
 import (
 	"context"
 	"flag"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
 	"github.com/pachmu/skyeng-push-notificator/config"
 	"github.com/pachmu/skyeng-push-notificator/internal/bot"
 	"github.com/pachmu/skyeng-push-notificator/internal/sender"
 	"github.com/pachmu/skyeng-push-notificator/internal/skyeng"
 	"github.com/pachmu/skyeng-push-notificator/internal/state"
+	"github.com/pachmu/skyeng-push-notificator/internal/storage"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+	"os"
+	"os/signal"
+	"syscall"
 )
 
 var configPath = flag.String("config", "./config/config.yaml", "Path to config file")
@@ -27,13 +26,8 @@ func main() {
 	}
 	skyengClient := skyeng.NewClient(conf.Skyeng.User, conf.Skyeng.Password)
 
-	st := state.NewState(time.Second * conf.SendInterval)
+	st := state.NewState(conf.SendInterval)
 	sndr := sender.NewSender(st)
-	handler := bot.NewMessageHandler(conf.Bot.User, skyengClient, st)
-	bt, err := bot.NewTelegramBot(conf.Bot.Token, handler)
-	if err != nil {
-		logrus.Fatal(err)
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	errGr, ctx := errgroup.WithContext(ctx)
 	errGr.Go(func() error {
@@ -44,6 +38,13 @@ func main() {
 		return nil
 	})
 	logrus.Info("Sender started")
+
+	dataStorage := storage.NewYamlStorage(conf.YamlStorage.FilePath)
+	handler := bot.NewMessageHandler(conf.Bot.User, skyengClient, st, dataStorage)
+	bt, err := bot.NewTelegramBot(conf.Bot.Token, handler)
+	if err != nil {
+		logrus.Fatal(err)
+	}
 
 	errGr.Go(func() error {
 		err := bt.Run(ctx)

@@ -12,6 +12,7 @@ import (
 	"github.com/go-telegram-bot-api/telegram-bot-api"
 	"github.com/pachmu/skyeng-push-notificator/internal/skyeng"
 	"github.com/pachmu/skyeng-push-notificator/internal/state"
+	"github.com/pachmu/skyeng-push-notificator/internal/storage"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -27,7 +28,7 @@ func NewTelegramBot(token string, handler *MessageHandler) (TelegramBot, error) 
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	handler.api = b
+
 	return &bot{
 		handler: handler,
 		bot:     b,
@@ -61,6 +62,10 @@ type bot struct {
 }
 
 func (b *bot) Run(ctx context.Context) error {
+	err := b.handler.init(b.bot)
+	if err != nil {
+		return err
+	}
 	b.bot.Debug = false
 
 	logrus.Infof("Authorized on account %s", b.bot.Self.UserName)
@@ -91,12 +96,29 @@ func (b *bot) Run(ctx context.Context) error {
 }
 
 // NewMessageHandler returns MessageHandler.
-func NewMessageHandler(user string, client skyeng.Client, state *state.State) *MessageHandler {
-	h := &MessageHandler{
+func NewMessageHandler(user string, client skyeng.Client, state *state.State, storage storage.Storage) *MessageHandler {
+	return &MessageHandler{
 		skyengClient: client,
 		user:         user,
 		state:        state,
+		storage:      storage,
 	}
+}
+
+// MessageHandler represents bot message handling functionality.
+type MessageHandler struct {
+	api          *tgbotapi.BotAPI
+	user         string
+	actions      botActions
+	state        *state.State
+	storage      storage.Storage
+	skyengClient skyeng.Client
+	callbacks    botCallbacks
+	data         *storage.Data
+}
+
+func (h *MessageHandler) init(api *tgbotapi.BotAPI) error {
+	h.api = api
 	h.actions = botActions{
 		actionStart: func(m *tgbotapi.Message, params []string) (tgbotapi.Chattable, error) {
 			resp := h.getReplyText(m, "Hello "+m.From.UserName+"! Please choose the action:")
@@ -104,14 +126,10 @@ func NewMessageHandler(user string, client skyeng.Client, state *state.State) *M
 			return resp, nil
 		},
 		actionStartRandom: func(m *tgbotapi.Message, params []string) (tgbotapi.Chattable, error) {
-			resp := h.getReplyText(m, "")
-			f, err := h.getRandomPeriodicSenderCallback(resp)
+			resp, err := h.startRandomSending(m.Chat.ID)
 			if err != nil {
 				return nil, err
 			}
-			state.SetWordsetCallback(f)
-			resp.Text = "Random sending started!"
-
 			return resp, nil
 		},
 		actionGetWordsets: func(m *tgbotapi.Message, params []string) (tgbotapi.Chattable, error) {
@@ -134,7 +152,12 @@ func NewMessageHandler(user string, client skyeng.Client, state *state.State) *M
 			if err != nil {
 				return nil, errors.Wrap(err, "failed to parse interval value")
 			}
-			h.state.ChangeTimeInterval(time.Duration(interval) * time.Minute)
+			h.state.ChangeTimeInterval(time.Duration(interval))
+			h.data.Interval = time.Duration(interval)
+			err = h.storage.WriteData(h.data)
+			if err != nil {
+				return nil, err
+			}
 			return h.getReplyText(m, "Time interval changed!"), nil
 		},
 	}
@@ -233,34 +256,20 @@ func NewMessageHandler(user string, client skyeng.Client, state *state.State) *M
 			if len(args) < 2 {
 				return nil, errors.New("not enough args")
 			}
-
-			state.SetWordsetCallback(func() error {
-				wordsetResp := h.getReplyText(query.Message, "")
-				err := h.showWords(wordsetResp, wordsetID, strings.Join(args[1:], ""))
-				if err != nil {
-					return err
-				}
-				_, err = h.api.Send(wordsetResp)
-				if err != nil {
-					return errors.WithStack(err)
-				}
-				return nil
-			})
-			return h.getReplyText(query.Message, "Wordset changed!"), nil
+			wordsetName := strings.Join(args[1:], "")
+			resp, err := h.startWordsetSending(query.Message.Chat.ID, wordsetID, wordsetName)
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
 		},
 	}
 
-	return h
-}
-
-// MessageHandler represents bot message handling functionality.
-type MessageHandler struct {
-	api          *tgbotapi.BotAPI
-	user         string
-	actions      botActions
-	state        *state.State
-	skyengClient skyeng.Client
-	callbacks    botCallbacks
+	err := h.setupState()
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (h *MessageHandler) handle(upd tgbotapi.Update) error {
@@ -312,18 +321,6 @@ func getUser(upd tgbotapi.Update) string {
 	}
 
 	return user
-}
-
-func getMessage(upd tgbotapi.Update) *tgbotapi.Message {
-	var message *tgbotapi.Message
-	if upd.Message != nil {
-		message = upd.Message
-	}
-	if upd.CallbackQuery != nil {
-		message = upd.CallbackQuery.Message
-	}
-
-	return message
 }
 
 func (h *MessageHandler) getReplyText(m *tgbotapi.Message, txt string) *tgbotapi.MessageConfig {
@@ -392,7 +389,47 @@ func (h *MessageHandler) handleCallback(query *tgbotapi.CallbackQuery) (tgbotapi
 	return resp, nil
 }
 
-func (h *MessageHandler) getRandomPeriodicSenderCallback(resp *tgbotapi.MessageConfig) (func() error, error) {
+func (h *MessageHandler) startWordsetSending(chatID int64, wordsetID int, wordsetName string) (tgbotapi.Chattable, error) {
+	h.state.SetWordsetCallback(func() error {
+		resp := tgbotapi.NewMessage(chatID, "")
+		err := h.showWords(&resp, wordsetID, wordsetName)
+		if err != nil {
+			return err
+		}
+		_, err = h.api.Send(resp)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		return nil
+	})
+	h.data.WordsetID = wordsetID
+	h.data.WordsetName = wordsetName
+	h.data.ChatID = chatID
+	err := h.storage.WriteData(h.data)
+	if err != nil {
+		return nil, err
+	}
+	resp := tgbotapi.NewMessage(chatID, "Wordset changed!")
+	return &resp, nil
+}
+
+func (h *MessageHandler) startRandomSending(chatID int64) (tgbotapi.Chattable, error) {
+	f, err := h.getRandomPeriodicSenderCallback(chatID)
+	if err != nil {
+		return nil, err
+	}
+	h.state.SetWordsetCallback(f)
+	h.data.Random = true
+	h.data.ChatID = chatID
+	err = h.storage.WriteData(h.data)
+	if err != nil {
+		return nil, err
+	}
+	resp := tgbotapi.NewMessage(chatID, "Random sending started!")
+	return &resp, nil
+}
+
+func (h *MessageHandler) getRandomPeriodicSenderCallback(chatID int64) (func() error, error) {
 	wordsets, err := h.skyengClient.GetWordsets(0)
 	if err != nil {
 		return nil, err
@@ -404,7 +441,7 @@ func (h *MessageHandler) getRandomPeriodicSenderCallback(resp *tgbotapi.MessageC
 	}
 	return func() error {
 		wordsetID, name := getRandWordsetID()
-		wordsetResp := tgbotapi.NewMessage(resp.ChatID, "")
+		wordsetResp := tgbotapi.NewMessage(chatID, "")
 		err := h.showWords(&wordsetResp, wordsetID, name)
 		if err != nil {
 			return err
@@ -577,5 +614,29 @@ func (h *MessageHandler) authorize(user string) error {
 		return fmt.Errorf("I don't know you, %s", user)
 	}
 
+	return nil
+}
+
+func (h *MessageHandler) setupState() error {
+	data, err := h.storage.GetData()
+	if err != nil {
+		return err
+	}
+	h.data = data
+	if data.Interval != 0 {
+		h.state.ChangeTimeInterval(data.Interval)
+	}
+	if data.Random {
+		_, err = h.startRandomSending(data.ChatID)
+		if err != nil {
+			return err
+		}
+		return nil
+	} else if data.WordsetID != 0 {
+		_, err = h.startWordsetSending(data.ChatID, data.WordsetID, data.WordsetName)
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }

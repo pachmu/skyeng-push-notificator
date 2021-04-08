@@ -27,15 +27,20 @@ type Bot struct {
 	User  string `yaml:"user"`
 }
 
+type YamlStorage struct {
+	FilePath string `yaml:"file_path"`
+}
+
 // Config represents parent config group.
 type Config struct {
 	// Port for http server.
 	Port int `yaml:"http_port"`
 	// Send words interval.
-	SendInterval time.Duration `yaml:"send_interval"` // seconds
+	SendInterval time.Duration `yaml:"send_interval"` // minutes
 	Bot          Bot           `yaml:"bot"`
 	Skyeng       Skyeng        `yaml:"skyeng"`
 	Pushover     Pushover      `yaml:"pushover"`
+	YamlStorage  YamlStorage   `yaml:"yaml_storage"`
 }
 
 // GetConfig returns config.

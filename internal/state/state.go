@@ -18,9 +18,9 @@ func NewState(timeInterval time.Duration) *State {
 		sendWordsetCallback: func() error {
 			return nil
 		},
-		timeInterval:   timeInterval,
-		changeInterval: make(chan time.Duration),
-		suspend:        make(chan struct{}),
+		timeInterval:   timeInterval * time.Minute,
+		changeInterval: make(chan time.Duration, 1),
+		suspend:        make(chan struct{}, 1),
 	}
 }
 
@@ -59,7 +59,7 @@ func (s *State) SetWordsetCallback(callback func() error) {
 func (s *State) ChangeTimeInterval(interval time.Duration) {
 	s.mx.Lock()
 	defer s.mx.Unlock()
-	s.changeInterval <- interval
+	s.changeInterval <- interval * time.Minute
 }
 
 // SuspendWork suspending sender.
